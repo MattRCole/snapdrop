@@ -348,4 +348,4 @@ class Peer {
 }
 
 
-const server = new SnapdropServer(process.env.PORT || 3000);
+new SnapdropServer(process.env.PORT || 3000);
