@@ -1,4 +1,73 @@
-var process = require('process')
+import process from 'process'
+
+type Socket = import('ws').WebSocket
+type SocketServer = import('ws').Server & {
+    readonly readyState: Socket['readyState']
+    readonly CONNECTING: 0;
+    readonly OPEN: 1;
+    readonly CLOSING: 2;
+    readonly CLOSED: 3;
+}
+type IncomingMessage = import('http').IncomingMessage & { peerId?: string }
+
+type SnapDropCommonMessage = {
+    type: 'disconnect' | 'pong' | 'peer' | 'display-name' | 'peer-joined'
+}
+
+type SnapDropMessageType = 'disconnect' | 'pong' | 'peer' | 'display-name' | 'peer-joined'
+
+type SnapDropOutgoingMessages = {
+    'peer-joined': {
+        peer: ReturnType<Peer['getInfo']>
+    },
+    'display-name': {
+        message: {
+            displayName: string
+            deviceName: string
+        }
+    }
+    peers: {
+        peers: ReturnType<Peer['getInfo']>[]
+    }
+    disconnect: {
+    }
+    pong: {
+    }
+}
+
+type SnapDropOutgoingMessage<T extends SnapDropMessageType> = { type: T } & T extends 'peer-joined'
+    ? SnapDropOutgoingMessages['peer-joined']
+    : T extends 'display-name'
+    ? SnapDropOutgoingMessages['display-name']
+    : T extends 'peers'
+    ? SnapDropOutgoingMessages['peers']
+    : T extends 'disconnect'
+    ? SnapDropOutgoingMessages['disconnect']
+    : T extends 'pong'
+    ? SnapDropOutgoingMessages['pong']
+    : never
+
+type SnapDropIncomingMessage = { to: string } & SnapDropCommonMessage
+
+const omit = <T extends any, K extends (keyof T)[]>(keys: K, obj: T): Omit<T, K[number]> => {
+    return Object
+        .entries(obj)
+        .reduce((acc, [key, value]) => ({
+            ...acc,
+            ...keys.includes(key as keyof T) ? {} : { [key]: value }
+        }), {} as Omit<T, K[number]>)
+}
+
+const hashCode = (str: string) => {
+    var hash = 0, i, chr;
+    for (i = 0; i < str.length; i++) {
+      chr   = str.charCodeAt(i);
+      hash  = ((hash << 5) - hash) + chr;
+      hash |= 0; // Convert to 32bit integer
+    }
+    return hash;
+}
+
 // Handle SIGINT
 process.on('SIGINT', () => {
   console.info("SIGINT Received, exiting...")
@@ -16,20 +85,23 @@ const { uniqueNamesGenerator, animals, colors } = require('unique-names-generato
 
 class SnapdropServer {
 
-    constructor(port) {
+    private _wss: SocketServer
+    private _rooms: { [roomId: string]: { [peerId: string]: Peer } }
+
+    constructor(port: number | string) {
         const WebSocket = require('ws');
         this._wss = new WebSocket.Server({ port: port });
         this._wss.on('connection', (socket, request) => this._onConnection(new Peer(socket, request)));
-        this._wss.on('headers', (headers, response) => this._onHeaders(headers, response));
+        this._wss.on('headers', (headers, response) => this._onHeaders(headers, response as IncomingMessage));
 
         this._rooms = {};
 
         console.log('Snapdrop is running on port', port);
     }
 
-    _onConnection(peer) {
+    _onConnection(peer: Peer) {
         this._joinRoom(peer);
-        peer.socket.on('message', message => this._onMessage(peer, message));
+        peer.socket.on('message', (message: string) => this._onMessage(peer, message));
         peer.socket.on('error', console.error);
         this._keepAlive(peer);
 
@@ -43,21 +115,22 @@ class SnapdropServer {
         });
     }
 
-    _onHeaders(headers, response) {
+    _onHeaders(headers: string[], response: IncomingMessage) {
         if (response.headers.cookie && response.headers.cookie.indexOf('peerid=') > -1) return;
         response.peerId = Peer.uuid();
         headers.push('Set-Cookie: peerid=' + response.peerId + "; SameSite=Strict; Secure");
     }
 
-    _onMessage(sender, message) {
+    _onMessage(sender: Peer, message: string) {
         // Try to parse message 
         try {
-            message = JSON.parse(message);
+            JSON.parse(message);
         } catch (e) {
             return; // TODO: handle malformed JSON
         }
+        const parsedMessage: SnapDropIncomingMessage = JSON.parse(message)
 
-        switch (message.type) {
+        switch (parsedMessage.type) {
             case 'disconnect':
                 this._leaveRoom(sender);
                 break;
@@ -67,18 +140,22 @@ class SnapdropServer {
         }
 
         // relay message to recipient
-        if (message.to && this._rooms[sender.ip]) {
-            const recipientId = message.to; // TODO: sanitize
+        if (parsedMessage.to && this._rooms[sender.ip]) {
+            const recipientId = parsedMessage.to; // TODO: sanitize
             const recipient = this._rooms[sender.ip][recipientId];
-            delete message.to;
-            // add sender id
-            message.sender = sender.id;
-            this._send(recipient, message);
+            // delete parsedMessage.to;
+            // // add sender id
+            // parsedMessage.sender = sender.id;
+
+            this._send(recipient, {
+                ...omit(['to'], parsedMessage),
+                sender: sender.id
+            });
             return;
         }
     }
 
-    _joinRoom(peer) {
+    _joinRoom(peer: Peer) {
         // if room doesn't exist, create it
         if (!this._rooms[peer.ip]) {
             this._rooms[peer.ip] = {};
@@ -108,7 +185,7 @@ class SnapdropServer {
         this._rooms[peer.ip][peer.id] = peer;
     }
 
-    _leaveRoom(peer) {
+    _leaveRoom(peer: Peer) {
         if (!this._rooms[peer.ip] || !this._rooms[peer.ip][peer.id]) return;
         this._cancelKeepAlive(this._rooms[peer.ip][peer.id]);
 
@@ -128,14 +205,14 @@ class SnapdropServer {
         }
     }
 
-    _send(peer, message) {
+    _send<T extends SnapDropMessageType>(peer: Peer, message: SnapDropOutgoingMessage<T>) {
         if (!peer) return;
         if (this._wss.readyState !== this._wss.OPEN) return;
-        message = JSON.stringify(message);
-        peer.socket.send(message, error => '');
+        const serializedMessage = JSON.stringify(message);
+        peer.socket.send(serializedMessage, _ => '');
     }
 
-    _keepAlive(peer) {
+    _keepAlive(peer: Peer) {
         this._cancelKeepAlive(peer);
         var timeout = 30000;
         if (!peer.lastBeat) {
@@ -151,7 +228,7 @@ class SnapdropServer {
         peer.timerId = setTimeout(() => this._keepAlive(peer), timeout);
     }
 
-    _cancelKeepAlive(peer) {
+    _cancelKeepAlive(peer: Peer) {
         if (peer && peer.timerId) {
             clearTimeout(peer.timerId);
         }
@@ -161,8 +238,22 @@ class SnapdropServer {
 
 
 class Peer {
+    public socket: Socket
+    public rtcSupported: boolean
+    public timerId: number | NodeJS.Timeout
+    public lastBeat: number
+    public name: {
+        model: string,
+        os: string,
+        browser: string,
+        type: string,
+        deviceName: string,
+        displayName: string
+    }
+    public ip: string
+    public id: string
 
-    constructor(socket, request) {
+    constructor(socket: Socket, request: IncomingMessage) {
         // set socket
         this.socket = socket;
 
@@ -181,9 +272,9 @@ class Peer {
         this.lastBeat = Date.now();
     }
 
-    _setIP(request) {
+    _setIP(request: IncomingMessage) {
         if (request.headers['x-forwarded-for']) {
-            this.ip = request.headers['x-forwarded-for'].split(/\s*,\s*/)[0];
+            this.ip = (request.headers['x-forwarded-for'] as string).split(/\s*,\s*/)[0];
         } else {
             this.ip = request.connection.remoteAddress;
         }
@@ -193,7 +284,7 @@ class Peer {
         }
     }
 
-    _setPeerId(request) {
+    _setPeerId(request: IncomingMessage) {
         if (request.peerId) {
             this.id = request.peerId;
         } else {
@@ -205,7 +296,7 @@ class Peer {
         return `<Peer id=${this.id} ip=${this.ip} rtcSupported=${this.rtcSupported}>`
     }
 
-    _setName(req) {
+    _setName(req: IncomingMessage) {
         let ua = parser(req.headers['user-agent']);
 
 
@@ -229,7 +320,7 @@ class Peer {
             separator: ' ',
             dictionaries: [colors, animals],
             style: 'capital',
-            seed: this.id.hashCode()
+            seed: hashCode(this.id)
         })
 
         this.name = {
@@ -252,41 +343,9 @@ class Peer {
 
     // return uuid of form xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
     static uuid() {
-        let uuid = '',
-            ii;
-        for (ii = 0; ii < 32; ii += 1) {
-            switch (ii) {
-                case 8:
-                case 20:
-                    uuid += '-';
-                    uuid += (Math.random() * 16 | 0).toString(16);
-                    break;
-                case 12:
-                    uuid += '-';
-                    uuid += '4';
-                    break;
-                case 16:
-                    uuid += '-';
-                    uuid += (Math.random() * 4 | 8).toString(16);
-                    break;
-                default:
-                    uuid += (Math.random() * 16 | 0).toString(16);
-            }
-        }
-        return uuid;
+        return crypto.randomUUID()
     };
 }
 
-Object.defineProperty(String.prototype, 'hashCode', {
-  value: function() {
-    var hash = 0, i, chr;
-    for (i = 0; i < this.length; i++) {
-      chr   = this.charCodeAt(i);
-      hash  = ((hash << 5) - hash) + chr;
-      hash |= 0; // Convert to 32bit integer
-    }
-    return hash;
-  }
-});
 
 const server = new SnapdropServer(process.env.PORT || 3000);
